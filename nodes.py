@@ -44,6 +44,51 @@ def _validate_single_conditioning(name: str, conditioning: Any) -> tuple[torch.T
     return cross_attn, options
 
 
+def _flatten_token_tensor(value: Any) -> torch.Tensor | None:
+    if not torch.is_tensor(value):
+        return None
+    if value.ndim == 1:
+        return value
+    if value.ndim == 2 and value.shape[0] == 1:
+        return value.reshape(-1)
+    return None
+
+
+def _segment_token_length(cross_attn: torch.Tensor, options: dict) -> int:
+    t5xxl_ids = _flatten_token_tensor(options.get("t5xxl_ids"))
+    if t5xxl_ids is not None and t5xxl_ids.numel() > 0:
+        return int(t5xxl_ids.numel())
+    return int(cross_attn.shape[1])
+
+
+def _merge_segment_options(
+    ordered_data: list[tuple[str, torch.Tensor, dict]],
+    chosen_options: dict,
+) -> dict:
+    merged = copy.deepcopy(chosen_options)
+
+    keys_to_concat = ("t5xxl_ids", "t5xxl_weights", "attention_mask")
+    for key in keys_to_concat:
+        chunks = []
+        all_have_key = True
+        for _, _, options in ordered_data:
+            flat = _flatten_token_tensor(options.get(key))
+            if flat is None:
+                all_have_key = False
+                break
+            chunks.append(flat)
+
+        if not all_have_key or not chunks:
+            continue
+
+        cat = torch.cat(chunks, dim=0)
+        if key == "attention_mask":
+            cat = cat.unsqueeze(0)
+        merged[key] = cat
+
+    return merged
+
+
 def _collect_segments(region_1, region_2, region_3, region_4, base, base_position: str):
     region_segments = []
     for name, cond in [
@@ -139,6 +184,7 @@ class AnimaRegionalConditioningConcat:
 
         tokens = []
         segment_ranges = []
+        ordered_data: list[tuple[str, torch.Tensor, dict]] = []
         chosen_options = None
         position = 0
         embed_dim = None
@@ -160,13 +206,16 @@ class AnimaRegionalConditioningConcat:
             elif chosen_options is None:
                 chosen_options = copy.deepcopy(options)
 
-            length = cross_attn.shape[1]
+            ordered_data.append((name, cross_attn, options))
+            length = _segment_token_length(cross_attn, options)
             segment_ranges.append({"name": name, "start": position, "end": position + length})
             position += length
             tokens.append(cross_attn)
 
         if chosen_options is None:
             chosen_options = {}
+        else:
+            chosen_options = _merge_segment_options(ordered_data, chosen_options)
 
         concat_cross_attn = torch.cat(tokens, dim=1)
         conditioning_cat = [[concat_cross_attn, chosen_options]]
