@@ -26,10 +26,10 @@ def _debug_log(msg: str) -> None:
 
 
 def _debug_log_reset() -> None:
-    """Clear the debug log file for a fresh run."""
+    """Write a separator for a fresh run (preserves previous entries)."""
     try:
-        with open(_DEBUG_LOG_PATH, "w") as f:
-            f.write(f"=== Anima Regional Debug Log (started {time.strftime('%Y-%m-%d %H:%M:%S')}) ===\n")
+        with open(_DEBUG_LOG_PATH, "a") as f:
+            f.write(f"\n=== New run ({time.strftime('%Y-%m-%d %H:%M:%S')}) ===\n")
     except Exception:
         pass
 
@@ -279,14 +279,44 @@ def anima_regional_override(orig_attention_fn, q, k, v, heads, **kwargs):
     if cross_only and not is_cross_attn:
         return orig_attention_fn(q, k, v, heads, **kwargs)
 
-    if bias_template.shape[-2:] != (n_q, n_k):
-        # Log EVERY shape mismatch (this is critical diagnostic info)
+    bias_nq = bias_template.shape[-2]
+    bias_nk = bias_template.shape[-1]
+
+    # ---- Nq mismatch: can't fix, skip ----
+    if bias_nq != n_q:
         if _override_call_count <= 5 or debug:
             _debug_log(
-                f"  SHAPE MISMATCH: bias_template={tuple(bias_template.shape)} "
-                f"but attention needs ({n_q}, {n_k}). q={tuple(q.shape)} k={tuple(k.shape)}"
+                f"  Nq MISMATCH (unfixable): bias Nq={bias_nq} != attn Nq={n_q}. "
+                f"q={tuple(q.shape)} k={tuple(k.shape)}"
             )
         return orig_attention_fn(q, k, v, heads, **kwargs)
+
+    # ---- Nk mismatch: pad bias to match (model pads text to fixed length) ----
+    if bias_nk != n_k:
+        if bias_nk > n_k:
+            # Bias is WIDER than needed — truncate (shouldn't normally happen)
+            if _override_call_count <= 3:
+                _debug_log(f"  Truncating bias Nk: {bias_nk} -> {n_k}")
+            bias_template = bias_template[:, :, :, :n_k]
+        else:
+            # Bias is NARROWER than needed — model pads text to fixed length
+            # (e.g., Anima pads LLMAdapter output to 512).
+            # Pad with minimum bias value to SUPPRESS attention to padding tokens.
+            pad_width = n_k - bias_nk
+            pad_value = float(bias_template.min().item())
+            if _override_call_count <= 3:
+                _debug_log(
+                    f"  Padding bias Nk: {bias_nk} -> {n_k} (+{pad_width} cols, "
+                    f"fill={pad_value:.2f})"
+                )
+            padding = torch.full(
+                (bias_template.shape[0], bias_template.shape[1], bias_nq, pad_width),
+                pad_value, dtype=bias_template.dtype, device=bias_template.device,
+            )
+            bias_template = torch.cat([bias_template, padding], dim=-1)
+            # Update the template in transformer_options so subsequent layers
+            # within the same step reuse the padded version.
+            transformer_options["anima_regional_bias_template"] = bias_template
 
     cond_or_uncond = transformer_options.get("cond_or_uncond")
 
