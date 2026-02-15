@@ -1,0 +1,3 @@
+# This package is loaded by ComfyUI as a custom node.
+# ComfyUI already provides torch in most installs.
+# Add extra pip dependencies here only if new external packages are introduced.
