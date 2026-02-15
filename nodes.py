@@ -38,14 +38,15 @@ try:
 except Exception:  # pragma: no cover - compatibility path for older ComfyUI builds
     comfy_hooks = None
 
-# PyTorch-native attention fallback.  xformers does not support tensor
+# Pure-math attention fallback.  xformers does not support tensor
 # ``attn_bias`` on every GPU architecture (e.g. Blackwell SM 12.0 has no
-# compatible FA/cutlass backend).  When we inject a regional bias we
-# route through PyTorch SDPA instead, which works everywhere.
+# compatible FA/cutlass backend), and PyTorch SDPA may select a cuDNN or
+# FA kernel that also mishandles the mask on very new hardware.
+# ``attention_basic`` uses einsum + explicit softmax — works everywhere.
 try:
-    from comfy.ldm.modules.attention import attention_pytorch as _attention_pytorch
+    from comfy.ldm.modules.attention import attention_basic as _attention_basic
 except Exception:  # pragma: no cover
-    _attention_pytorch = None
+    _attention_basic = None
 
 from .regional_core import (
     build_bias_template,
@@ -367,16 +368,15 @@ def anima_regional_override(orig_attention_fn, q, k, v, heads, **kwargs):
     # ---- Backend selection ------------------------------------------------
     # xformers ``memory_efficient_attention`` does not support a plain-tensor
     # ``attn_bias`` on every GPU architecture (notably Blackwell / SM 12.0
-    # has no compatible FA or cutlass backend).  When we inject a regional
-    # bias tensor we therefore route through PyTorch-native SDPA which
-    # accepts ``attn_mask`` on all CUDA devices.
+    # has no compatible FA or cutlass backend).  PyTorch SDPA may also
+    # select a cuDNN/FA kernel that mishandles the mask on very new GPUs.
     #
-    # ``_attention_pytorch`` is the *wrapped* version (has @wrap_attn) but
-    # the caller (wrap_attn.wrapper) already placed ``_inside_attn_wrapper``
-    # into *kwargs*, so calling it here skips the override check and goes
-    # straight to the inner function — no infinite recursion.
-    if _attention_pytorch is not None:
-        return _attention_pytorch(q, k, v, heads, **kwargs)
+    # ``attention_basic`` uses einsum + explicit softmax — guaranteed correct
+    # on ALL hardware.  It is the *wrapped* version (has @wrap_attn) and
+    # the caller already placed ``_inside_attn_wrapper`` into *kwargs*,
+    # so calling it re-enters the inner function directly.
+    if _attention_basic is not None:
+        return _attention_basic(q, k, v, heads, **kwargs)
 
     # Fallback: hope for the best with the original backend.
     return orig_attention_fn(q, k, v, heads, **kwargs)
