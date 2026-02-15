@@ -1,5 +1,6 @@
 import copy
 import logging
+import math
 from typing import Any
 
 import torch
@@ -61,6 +62,43 @@ def _segment_token_length(cross_attn: torch.Tensor, options: dict) -> int:
     return int(cross_attn.shape[1])
 
 
+def _strip_padding(cross_attn: torch.Tensor, options: dict) -> tuple[torch.Tensor, dict, int]:
+    """Strip padding tokens from a conditioning segment using attention_mask.
+
+    Many text encoders (e.g. T5) pad every prompt to a fixed min_length (often 512).
+    When multiple padded segments are concatenated, the padding tokens dominate the
+    cross-attention softmax and dilute the real text signal — causing washed-out,
+    impressionistic output.
+
+    Returns (stripped_cross_attn, stripped_options, n_real_tokens).
+    """
+    mask = options.get("attention_mask")
+    if mask is None:
+        return cross_attn, options, cross_attn.shape[1]
+
+    mask_flat = _flatten_token_tensor(mask)
+    if mask_flat is None:
+        return cross_attn, options, cross_attn.shape[1]
+
+    n_real = int(mask_flat.sum().item())
+    if n_real <= 0:
+        return cross_attn, options, cross_attn.shape[1]  # safety
+    if n_real >= cross_attn.shape[1]:
+        return cross_attn, options, cross_attn.shape[1]  # no padding
+
+    stripped = cross_attn[:, :n_real, :]
+
+    new_options = copy.copy(options)
+    for key in ("t5xxl_ids", "t5xxl_weights"):
+        flat = _flatten_token_tensor(options.get(key))
+        if flat is not None and flat.numel() >= n_real:
+            new_options[key] = flat[:n_real]
+    # All remaining tokens are real — attention_mask is no longer needed.
+    new_options.pop("attention_mask", None)
+
+    return stripped, new_options, n_real
+
+
 def _merge_segment_options(
     ordered_data: list[tuple[str, torch.Tensor, dict]],
     chosen_options: dict,
@@ -111,28 +149,82 @@ def _collect_segments(region_1, region_2, region_3, region_4, base, base_positio
     return region_segments + [("base", base)]
 
 
+def _get_current_sigma(transformer_options: dict) -> float | None:
+    """Extract the current sigma as a plain float from transformer_options."""
+    raw = transformer_options.get("sigmas")
+    if raw is None:
+        return None
+    if torch.is_tensor(raw):
+        raw = raw.item() if raw.numel() == 1 else raw[0].item()
+    return float(raw)
+
+
+def _should_apply_bias(transformer_options: dict) -> bool:
+    """Decide whether the regional bias should be active at the current sigma.
+
+    Two methods, tried in order:
+    1. **Sigma thresholds** – set when the user connects the *model* input.
+       Uses ``model_sampling.percent_to_sigma`` for accurate mapping.
+    2. **Runtime percentage fallback** – used when no model is connected.
+       Estimates denoising progress from sigma values via log-space
+       interpolation, tracked in the mutable ``_anima_state`` dict.
+    """
+    current_sigma = _get_current_sigma(transformer_options)
+
+    # --- Method 1: sigma thresholds (from model) ---------------------------
+    start_sigma = transformer_options.get("anima_regional_start_sigma")
+    end_sigma = transformer_options.get("anima_regional_end_sigma")
+    if start_sigma is not None or end_sigma is not None:
+        if current_sigma is None:
+            return True  # no sigma info → apply conservatively
+        if start_sigma is not None and current_sigma > start_sigma:
+            return False
+        if end_sigma is not None and current_sigma < end_sigma:
+            return False
+        return True
+
+    # --- Method 2: percentage + runtime sigma tracking ---------------------
+    start_pct = transformer_options.get("anima_regional_start_percent", 0.0)
+    end_pct = transformer_options.get("anima_regional_end_percent", 1.0)
+    if start_pct <= 0.0 and end_pct >= 1.0:
+        return True  # no gating requested
+    if current_sigma is None:
+        return True  # can't gate without sigma
+
+    state = transformer_options.get("_anima_state")
+    if state is None:
+        return True  # no tracking dict
+
+    # Record the maximum sigma seen (first step provides the highest sigma).
+    if "sigma_max" not in state or current_sigma > state["sigma_max"]:
+        state["sigma_max"] = current_sigma
+    sigma_max = state["sigma_max"]
+
+    # Estimate denoising progress in log-space  (0.0 = start, 1.0 = end)
+    SIGMA_MIN_EST = 0.001  # conservative lower bound
+    if sigma_max <= SIGMA_MIN_EST or current_sigma <= 0:
+        return True
+
+    if current_sigma >= sigma_max:
+        progress = 0.0
+    elif current_sigma <= SIGMA_MIN_EST:
+        progress = 1.0
+    else:
+        log_range = math.log(sigma_max) - math.log(SIGMA_MIN_EST)
+        progress = (math.log(sigma_max) - math.log(current_sigma)) / log_range
+        progress = max(0.0, min(1.0, progress))
+
+    return start_pct <= progress <= end_pct
+
+
 def anima_regional_override(orig_attention_fn, q, k, v, heads, **kwargs):
     transformer_options = kwargs.get("transformer_options", {})
     if not transformer_options.get("anima_regional_enabled", False):
         return orig_attention_fn(q, k, v, heads, **kwargs)
 
-    # ---- Sigma-based time gating ----
-    # Skip regional bias during early denoising steps to allow global composition
-    # formation; applying bias too early causes impressionistic / noisy output.
-    start_sigma = transformer_options.get("anima_regional_start_sigma")
-    end_sigma = transformer_options.get("anima_regional_end_sigma")
-    if start_sigma is not None or end_sigma is not None:
-        current_sigma = transformer_options.get("sigmas")
-        if current_sigma is not None:
-            if torch.is_tensor(current_sigma):
-                current_sigma = current_sigma.item() if current_sigma.numel() == 1 else current_sigma[0].item()
-            current_sigma = float(current_sigma)
-            # start_sigma: highest sigma (earliest step) at which bias should be active
-            # end_sigma: lowest sigma (latest step) at which bias should be active
-            if start_sigma is not None and current_sigma > start_sigma:
-                return orig_attention_fn(q, k, v, heads, **kwargs)
-            if end_sigma is not None and current_sigma < end_sigma:
-                return orig_attention_fn(q, k, v, heads, **kwargs)
+    # ---- Time gating (skip bias during early/late steps) ----
+    if not _should_apply_bias(transformer_options):
+        return orig_attention_fn(q, k, v, heads, **kwargs)
 
     bias_template = transformer_options.get("anima_regional_bias_template")
     if bias_template is None or not torch.is_tensor(bias_template):
@@ -234,6 +326,17 @@ class AnimaRegionalConditioningConcat:
                 chosen_options = copy.deepcopy(options)
             elif chosen_options is None:
                 chosen_options = copy.deepcopy(options)
+
+            # Strip padding tokens produced by fixed-length text encoders (e.g.
+            # T5 pads to 512).  This prevents dead padding tokens from dominating
+            # the cross-attention softmax and diluting the real text signal.
+            n_before = cross_attn.shape[1]
+            cross_attn, options, real_length = _strip_padding(cross_attn, options)
+            if real_length < n_before:
+                print(
+                    f"[AnimaRegional] Stripped {n_before - real_length} padding tokens "
+                    f"from '{name}' ({n_before} → {real_length})"
+                )
 
             ordered_data.append((name, cross_attn, options))
             length = _segment_token_length(cross_attn, options)
@@ -423,21 +526,26 @@ class AnimaApplyRegionalAttentionHook:
             if model_sampling is not None and hasattr(model_sampling, "percent_to_sigma"):
                 start_sigma = float(model_sampling.percent_to_sigma(start_percent))
                 end_sigma = float(model_sampling.percent_to_sigma(end_percent))
-                LOGGER.info(
-                    "anima_regional: scheduling bias from %.1f%% to %.1f%% "
-                    "(sigma <= %.4f and >= %.4f)",
-                    start_percent * 100, end_percent * 100, start_sigma, end_sigma,
+                print(
+                    f"[AnimaRegional] Scheduling bias: {start_percent*100:.0f}%-{end_percent*100:.0f}% "
+                    f"(sigma {start_sigma:.4f} → {end_sigma:.4f})"
                 )
             else:
-                LOGGER.warning(
-                    "anima_regional: model has no percent_to_sigma; "
-                    "time gating disabled — pass the model input to enable scheduling"
+                print(
+                    "[AnimaRegional] WARNING: model has no percent_to_sigma; "
+                    "falling back to runtime sigma estimation"
                 )
-        elif start_percent > 0.0 or end_percent < 1.0:
-            LOGGER.warning(
-                "anima_regional: start_percent/end_percent set but no model provided; "
-                "time gating disabled — connect the model input to enable scheduling"
-            )
+        else:
+            if start_percent > 0.0 or end_percent < 1.0:
+                print(
+                    f"[AnimaRegional] No model connected — using runtime sigma estimation "
+                    f"for scheduling ({start_percent*100:.0f}%-{end_percent*100:.0f}%)"
+                )
+            else:
+                print(
+                    "[AnimaRegional] No model connected, bias active for ALL steps. "
+                    "Set start_percent > 0 to delay activation (recommended: 0.15-0.40)"
+                )
 
         transformers_dict = {
             "optimized_attention_override": anima_regional_override,
@@ -445,8 +553,15 @@ class AnimaApplyRegionalAttentionHook:
             "anima_regional_enabled": True,
             "anima_regional_cross_only": bool(apply_to_cross_attn_only),
             "anima_regional_debug": bool(debug_shapes),
+            # Always store percentages for the runtime fallback gating path.
+            "anima_regional_start_percent": float(start_percent),
+            "anima_regional_end_percent": float(end_percent),
+            # Mutable dict for runtime sigma tracking (persists across steps
+            # because merge_nested_dicts assigns by reference).
+            "_anima_state": {},
         }
 
+        # When model is available, also add accurate sigma thresholds.
         if start_sigma is not None:
             transformers_dict["anima_regional_start_sigma"] = start_sigma
         if end_sigma is not None:

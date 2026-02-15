@@ -78,6 +78,46 @@ class RegionalCoreTests(unittest.TestCase):
         self.assertTrue(torch.all(gated[2:] == 0.0))
 
 
+class StripPaddingTests(unittest.TestCase):
+    """Test padding token stripping."""
+
+    def test_strips_padding_from_cross_attn(self):
+        from anima_regional_custom_nodes.nodes import _strip_padding
+
+        cross_attn = torch.randn(1, 512, 64)
+        mask = torch.zeros(1, 512)
+        mask[0, :10] = 1.0
+        options = {"attention_mask": mask, "t5xxl_ids": torch.arange(512)}
+
+        stripped, new_opts, n_real = _strip_padding(cross_attn, options)
+        self.assertEqual(n_real, 10)
+        self.assertEqual(stripped.shape, (1, 10, 64))
+        self.assertTrue(torch.equal(stripped, cross_attn[:, :10, :]))
+        self.assertEqual(new_opts["t5xxl_ids"].numel(), 10)
+        self.assertNotIn("attention_mask", new_opts)
+
+    def test_noop_without_mask(self):
+        from anima_regional_custom_nodes.nodes import _strip_padding
+
+        cross_attn = torch.randn(1, 20, 64)
+        options = {"some_key": "val"}
+
+        stripped, new_opts, n_real = _strip_padding(cross_attn, options)
+        self.assertEqual(n_real, 20)
+        self.assertIs(stripped, cross_attn)
+
+    def test_noop_when_all_real(self):
+        from anima_regional_custom_nodes.nodes import _strip_padding
+
+        cross_attn = torch.randn(1, 10, 64)
+        mask = torch.ones(1, 10)
+        options = {"attention_mask": mask}
+
+        stripped, new_opts, n_real = _strip_padding(cross_attn, options)
+        self.assertEqual(n_real, 10)
+        self.assertIs(stripped, cross_attn)
+
+
 class OverrideTimeGatingTests(unittest.TestCase):
     """Test that anima_regional_override respects sigma-based time gating."""
 
@@ -88,6 +128,12 @@ class OverrideTimeGatingTests(unittest.TestCase):
         v = torch.randn(batch, heads, n_k, dim_head)
         return q, k, v
 
+    def _fake_attn(self, call_log):
+        def fn(q, k, v, heads, **kwargs):
+            call_log.append(kwargs.get("mask"))
+            return torch.zeros(q.shape[0], q.shape[1], q.shape[2], v.shape[-1])
+        return fn
+
     def test_bias_skipped_when_sigma_too_high(self):
         """During early steps (high sigma), bias should be skipped."""
         from anima_regional_custom_nodes.nodes import anima_regional_override
@@ -97,10 +143,6 @@ class OverrideTimeGatingTests(unittest.TestCase):
         bias_template = torch.full((1, 1, n_img, n_text), -5.0)
 
         call_log = []
-        def fake_attn(q, k, v, heads, **kwargs):
-            call_log.append(kwargs.get("mask"))
-            return torch.zeros(q.shape[0], q.shape[1], q.shape[2], v.shape[-1])
-
         # sigma=10.0 is above start_sigma=5.0 → should skip bias
         transformer_options = {
             "anima_regional_enabled": True,
@@ -110,7 +152,7 @@ class OverrideTimeGatingTests(unittest.TestCase):
             "anima_regional_end_sigma": 0.0,
             "sigmas": torch.tensor([10.0]),
         }
-        anima_regional_override(fake_attn, q, k, v, 4, transformer_options=transformer_options)
+        anima_regional_override(self._fake_attn(call_log), q, k, v, 4, transformer_options=transformer_options)
         self.assertIsNone(call_log[-1], "Bias should be skipped when sigma > start_sigma")
 
     def test_bias_applied_when_sigma_in_range(self):
@@ -122,10 +164,6 @@ class OverrideTimeGatingTests(unittest.TestCase):
         bias_template = torch.full((1, 1, n_img, n_text), -5.0)
 
         call_log = []
-        def fake_attn(q, k, v, heads, **kwargs):
-            call_log.append(kwargs.get("mask"))
-            return torch.zeros(q.shape[0], q.shape[1], q.shape[2], v.shape[-1])
-
         # sigma=3.0 is below start_sigma=5.0 and above end_sigma=0.0 → should apply
         transformer_options = {
             "anima_regional_enabled": True,
@@ -135,7 +173,7 @@ class OverrideTimeGatingTests(unittest.TestCase):
             "anima_regional_end_sigma": 0.0,
             "sigmas": torch.tensor([3.0]),
         }
-        anima_regional_override(fake_attn, q, k, v, 4, transformer_options=transformer_options)
+        anima_regional_override(self._fake_attn(call_log), q, k, v, 4, transformer_options=transformer_options)
         self.assertIsNotNone(call_log[-1], "Bias should be applied when sigma is in active range")
 
     def test_bias_skipped_when_sigma_below_end(self):
@@ -147,10 +185,6 @@ class OverrideTimeGatingTests(unittest.TestCase):
         bias_template = torch.full((1, 1, n_img, n_text), -5.0)
 
         call_log = []
-        def fake_attn(q, k, v, heads, **kwargs):
-            call_log.append(kwargs.get("mask"))
-            return torch.zeros(q.shape[0], q.shape[1], q.shape[2], v.shape[-1])
-
         # sigma=0.01 is below end_sigma=0.5 → should skip
         transformer_options = {
             "anima_regional_enabled": True,
@@ -160,8 +194,66 @@ class OverrideTimeGatingTests(unittest.TestCase):
             "anima_regional_end_sigma": 0.5,
             "sigmas": torch.tensor([0.01]),
         }
-        anima_regional_override(fake_attn, q, k, v, 4, transformer_options=transformer_options)
+        anima_regional_override(self._fake_attn(call_log), q, k, v, 4, transformer_options=transformer_options)
         self.assertIsNone(call_log[-1], "Bias should be skipped when sigma < end_sigma")
+
+
+class RuntimeSigmaFallbackTests(unittest.TestCase):
+    """Test that time gating works without model via runtime sigma estimation."""
+
+    def test_fallback_skips_early_steps(self):
+        from anima_regional_custom_nodes.nodes import _should_apply_bias
+
+        state = {}
+        # Step 1: sigma=80 (highest) with start_pct=0.20
+        # progress=0.0 → below start_pct → should NOT apply
+        opts = {
+            "anima_regional_start_percent": 0.20,
+            "anima_regional_end_percent": 1.0,
+            "_anima_state": state,
+            "sigmas": torch.tensor([80.0]),
+        }
+        self.assertFalse(_should_apply_bias(opts))
+        self.assertAlmostEqual(state["sigma_max"], 80.0)
+
+    def test_fallback_applies_at_midpoint(self):
+        from anima_regional_custom_nodes.nodes import _should_apply_bias
+
+        state = {"sigma_max": 80.0}
+        # sigma=1.0, progress ≈ (ln80 - ln1) / (ln80 - ln0.001) ≈ 4.38/11.29 ≈ 0.39
+        opts = {
+            "anima_regional_start_percent": 0.20,
+            "anima_regional_end_percent": 1.0,
+            "_anima_state": state,
+            "sigmas": torch.tensor([1.0]),
+        }
+        self.assertTrue(_should_apply_bias(opts))
+
+    def test_fallback_applies_all_when_no_gating(self):
+        from anima_regional_custom_nodes.nodes import _should_apply_bias
+
+        # start=0, end=1 → always apply
+        opts = {
+            "anima_regional_start_percent": 0.0,
+            "anima_regional_end_percent": 1.0,
+            "_anima_state": {},
+            "sigmas": torch.tensor([80.0]),
+        }
+        self.assertTrue(_should_apply_bias(opts))
+
+    def test_fallback_respects_end_percent(self):
+        from anima_regional_custom_nodes.nodes import _should_apply_bias
+
+        state = {"sigma_max": 80.0}
+        # sigma=0.002, progress ≈ (ln80 - ln0.002) / (ln80 - ln0.001) ≈ 10.60/11.29 ≈ 0.94
+        # With end_pct=0.80, 0.94 > 0.80 → should NOT apply
+        opts = {
+            "anima_regional_start_percent": 0.0,
+            "anima_regional_end_percent": 0.80,
+            "_anima_state": state,
+            "sigmas": torch.tensor([0.002]),
+        }
+        self.assertFalse(_should_apply_bias(opts))
 
 
 if __name__ == "__main__":
