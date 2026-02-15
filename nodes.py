@@ -38,16 +38,6 @@ try:
 except Exception:  # pragma: no cover - compatibility path for older ComfyUI builds
     comfy_hooks = None
 
-# Pure-math attention fallback.  xformers does not support tensor
-# ``attn_bias`` on every GPU architecture (e.g. Blackwell SM 12.0 has no
-# compatible FA/cutlass backend), and PyTorch SDPA may select a cuDNN or
-# FA kernel that also mishandles the mask on very new hardware.
-# ``attention_basic`` uses einsum + explicit softmax — works everywhere.
-try:
-    from comfy.ldm.modules.attention import attention_basic as _attention_basic
-except Exception:  # pragma: no cover
-    _attention_basic = None
-
 from .regional_core import (
     build_bias_template,
     build_cond_uncond_gated_bias,
@@ -354,32 +344,65 @@ def anima_regional_override(orig_attention_fn, q, k, v, heads, **kwargs):
             f"bias_range=[{bias.min().item():.2f}, {bias.max().item():.2f}] sigma={sigma}"
         )
 
-    existing_mask = kwargs.get("mask")
-    if existing_mask is None:
-        kwargs["mask"] = bias
-    elif torch.is_tensor(existing_mask):
-        if existing_mask.dtype == torch.bool:
-            kwargs["mask"] = existing_mask
-        else:
-            kwargs["mask"] = existing_mask.to(device=q.device, dtype=q.dtype) + bias
-    else:
-        kwargs["mask"] = bias
-
-    # ---- Backend selection ------------------------------------------------
-    # xformers ``memory_efficient_attention`` does not support a plain-tensor
-    # ``attn_bias`` on every GPU architecture (notably Blackwell / SM 12.0
-    # has no compatible FA or cutlass backend).  PyTorch SDPA may also
-    # select a cuDNN/FA kernel that mishandles the mask on very new GPUs.
+    # ---- Inline attention with regional bias ------------------------------
+    # We compute the biased attention *directly* here instead of delegating
+    # to any ComfyUI/xformers/PyTorch backend.  This avoids every possible
+    # backend incompatibility (xformers can't handle attn_bias on Blackwell;
+    # PyTorch SDPA may pick a cuDNN kernel that also fails).
     #
-    # ``attention_basic`` uses einsum + explicit softmax — guaranteed correct
-    # on ALL hardware.  It is the *wrapped* version (has @wrap_attn) and
-    # the caller already placed ``_inside_attn_wrapper`` into *kwargs*,
-    # so calling it re-enters the inner function directly.
-    if _attention_basic is not None:
-        return _attention_basic(q, k, v, heads, **kwargs)
+    # Cosmos feeds (B, H, S, D) with ``skip_reshape=True``.
+    # Non-Cosmos models may feed (B, S, H*D) with ``skip_reshape=False``.
+    skip_reshape = kwargs.get("skip_reshape", False)
+    if skip_reshape:
+        b, h, sq, d = q.shape
+    else:
+        b, sq_dim, hd = q.shape
+        d = hd // heads
+        h = heads
+        sq = sq_dim
+        q = q.view(b, sq, h, d).permute(0, 2, 1, 3)  # → (B,H,Sq,D)
+        k = k.view(b, -1, h, d).permute(0, 2, 1, 3)   # → (B,H,Sk,D)
+        v = v.view(b, -1, h, d).permute(0, 2, 1, 3)   # → (B,H,Sk,D)
 
-    # Fallback: hope for the best with the original backend.
-    return orig_attention_fn(q, k, v, heads, **kwargs)
+    scale = d ** -0.5
+
+    # Similarity in float32 for numerical stability
+    sim = torch.matmul(q.float(), k.float().transpose(-1, -2)) * scale
+    # sim: (B, H, Sq, Sk)
+
+    # Merge existing mask (if any) with our regional bias
+    existing_mask = kwargs.get("mask")
+    if existing_mask is not None and torch.is_tensor(existing_mask):
+        if existing_mask.dtype == torch.bool:
+            sim.masked_fill_(~existing_mask, -torch.finfo(sim.dtype).max)
+        else:
+            sim = sim + existing_mask.float()
+
+    # Apply regional bias — shape (B, 1, Sq, Sk) broadcasts over heads
+    sim = sim + bias.float()
+
+    # Softmax + weighted sum
+    attn_weights = sim.softmax(dim=-1)
+    out = torch.matmul(attn_weights.to(v.dtype), v)
+    # out: (B, H, Sq, D)
+
+    if _override_applied_count <= 3:
+        has_nan = torch.isnan(out).any().item()
+        has_inf = torch.isinf(out).any().item()
+        _debug_log(
+            f"  attn output: shape={tuple(out.shape)} "
+            f"range=[{out.min().item():.4f}, {out.max().item():.4f}] "
+            f"nan={has_nan} inf={has_inf}"
+        )
+
+    # Return in the format the caller expects
+    skip_output_reshape = kwargs.get("skip_output_reshape", False)
+    if skip_output_reshape:
+        # Caller wants (B, H, Sq, D) — keep as-is
+        return out
+    else:
+        # Caller wants (B, Sq, H*D)
+        return out.permute(0, 2, 1, 3).reshape(b, -1, h * d)
 
 
 class AnimaRegionalConditioningConcat:
