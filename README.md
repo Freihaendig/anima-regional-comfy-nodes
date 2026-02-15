@@ -2,6 +2,27 @@
 
 This custom node package implements single-pass regional conditioning for Anima/Cosmos/MiniTrainDiT models by injecting an additive cross-attention bias through ComfyUI's `optimized_attention_override` hook.
 
+## Install
+
+### Option A: One command (recommended)
+
+```bash
+gh repo clone Freihaendig/anima-regional-comfy-nodes /path/to/ComfyUI/custom_nodes/anima_regional && COMFYUI_DIR=/path/to/ComfyUI bash /path/to/ComfyUI/custom_nodes/anima_regional/install.sh
+```
+
+This clones into `ComfyUI/custom_nodes/anima_regional` and installs optional Python deps.
+
+### Option B: Manual
+
+```bash
+cd /path/to/ComfyUI/custom_nodes
+git clone https://github.com/Freihaendig/anima-regional-comfy-nodes.git anima_regional
+cd anima_regional
+python -m pip install -r requirements.txt
+```
+
+Then restart ComfyUI.
+
 ## What it does
 
 - Keeps stock ComfyUI sampling (`KSampler` and other standard samplers).
@@ -39,8 +60,8 @@ This custom node package implements single-pass regional conditioning for Anima/
 ## Example
 
 Prompt-style JSON examples are provided at:
-- `custom_nodes/anima_regional/examples/anima_regional_two_regions.json`
-- `custom_nodes/anima_regional/examples/anima_regional_left_right_masks.json`
+- `examples/anima_regional_two_regions.json`
+- `examples/anima_regional_left_right_masks.json`
 - These workflows build explicit left/right half masks using `SolidMask` + `MaskComposite`.
 - Replace those mask nodes with real masks (for example, loaded masks) when needed.
 
