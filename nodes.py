@@ -116,6 +116,24 @@ def anima_regional_override(orig_attention_fn, q, k, v, heads, **kwargs):
     if not transformer_options.get("anima_regional_enabled", False):
         return orig_attention_fn(q, k, v, heads, **kwargs)
 
+    # ---- Sigma-based time gating ----
+    # Skip regional bias during early denoising steps to allow global composition
+    # formation; applying bias too early causes impressionistic / noisy output.
+    start_sigma = transformer_options.get("anima_regional_start_sigma")
+    end_sigma = transformer_options.get("anima_regional_end_sigma")
+    if start_sigma is not None or end_sigma is not None:
+        current_sigma = transformer_options.get("sigmas")
+        if current_sigma is not None:
+            if torch.is_tensor(current_sigma):
+                current_sigma = current_sigma.item() if current_sigma.numel() == 1 else current_sigma[0].item()
+            current_sigma = float(current_sigma)
+            # start_sigma: highest sigma (earliest step) at which bias should be active
+            # end_sigma: lowest sigma (latest step) at which bias should be active
+            if start_sigma is not None and current_sigma > start_sigma:
+                return orig_attention_fn(q, k, v, heads, **kwargs)
+            if end_sigma is not None and current_sigma < end_sigma:
+                return orig_attention_fn(q, k, v, heads, **kwargs)
+
     bias_template = transformer_options.get("anima_regional_bias_template")
     if bias_template is None or not torch.is_tensor(bias_template):
         return orig_attention_fn(q, k, v, heads, **kwargs)
@@ -138,11 +156,22 @@ def anima_regional_override(orig_attention_fn, q, k, v, heads, **kwargs):
         return orig_attention_fn(q, k, v, heads, **kwargs)
 
     cond_or_uncond = transformer_options.get("cond_or_uncond")
-    bias = build_cond_uncond_gated_bias(
-        bias_template=bias_template,
-        b_total=q.shape[0],
-        cond_or_uncond=cond_or_uncond,
-    ).to(device=q.device, dtype=q.dtype)
+
+    # ---- Device-side caching ----
+    # Avoid repeated CPU->GPU transfers of the bias template on every attention call.
+    cache_key = ("anima_regional_bias_cache", q.shape[0], id(cond_or_uncond), q.device, q.dtype)
+    cached = transformer_options.get("_anima_cache", {}).get(cache_key)
+    if cached is not None:
+        bias = cached
+    else:
+        bias = build_cond_uncond_gated_bias(
+            bias_template=bias_template,
+            b_total=q.shape[0],
+            cond_or_uncond=cond_or_uncond,
+        ).to(device=q.device, dtype=q.dtype)
+        if "_anima_cache" not in transformer_options:
+            transformer_options["_anima_cache"] = {}
+        transformer_options["_anima_cache"][cache_key] = bias
 
     existing_mask = kwargs.get("mask")
     if existing_mask is None:
@@ -348,8 +377,22 @@ class AnimaApplyRegionalAttentionHook:
                 "negative": ("CONDITIONING",),
                 "bias_template": ("REGIONAL_ATTN_BIAS_TEMPLATE",),
                 "apply_to_cross_attn_only": ("BOOLEAN", {"default": True}),
+                "start_percent": ("FLOAT", {
+                    "default": 0.20, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Fraction of denoising steps to SKIP before activating regional bias. "
+                               "Early steps form global composition; applying bias too early produces "
+                               "impressionistic / noisy output. Recommended range: 0.15 - 0.40.",
+                }),
+                "end_percent": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Fraction of denoising at which to STOP applying regional bias. "
+                               "1.0 means keep it active until the final step.",
+                }),
                 "debug_shapes": ("BOOLEAN", {"default": False}),
-            }
+            },
+            "optional": {
+                "model": ("MODEL",),
+            },
         }
 
     RETURN_TYPES = ("CONDITIONING", "CONDITIONING")
@@ -357,7 +400,9 @@ class AnimaApplyRegionalAttentionHook:
     FUNCTION = "apply"
     CATEGORY = "conditioning/anima_regional"
 
-    def apply(self, positive, negative, bias_template, apply_to_cross_attn_only=True, debug_shapes=False):
+    def apply(self, positive, negative, bias_template,
+              apply_to_cross_attn_only=True, start_percent=0.20, end_percent=1.0,
+              debug_shapes=False, model=None):
         if comfy_hooks is None:
             raise RuntimeError(
                 "ComfyUI build is missing comfy.hooks. Update ComfyUI to a recent version that supports "
@@ -368,6 +413,32 @@ class AnimaApplyRegionalAttentionHook:
         if bias_template.ndim != 4:
             raise ValueError(f"bias_template must have shape [B,1,Nq,Nk], got {tuple(bias_template.shape)}")
 
+        # ---- Convert percent → sigma thresholds ----
+        # start_sigma: bias activates when sigma drops BELOW this value
+        # end_sigma:   bias deactivates when sigma drops BELOW this value
+        start_sigma = None
+        end_sigma = None
+        if model is not None:
+            model_sampling = model.get_model_object("model_sampling")
+            if model_sampling is not None and hasattr(model_sampling, "percent_to_sigma"):
+                start_sigma = float(model_sampling.percent_to_sigma(start_percent))
+                end_sigma = float(model_sampling.percent_to_sigma(end_percent))
+                LOGGER.info(
+                    "anima_regional: scheduling bias from %.1f%% to %.1f%% "
+                    "(sigma <= %.4f and >= %.4f)",
+                    start_percent * 100, end_percent * 100, start_sigma, end_sigma,
+                )
+            else:
+                LOGGER.warning(
+                    "anima_regional: model has no percent_to_sigma; "
+                    "time gating disabled — pass the model input to enable scheduling"
+                )
+        elif start_percent > 0.0 or end_percent < 1.0:
+            LOGGER.warning(
+                "anima_regional: start_percent/end_percent set but no model provided; "
+                "time gating disabled — connect the model input to enable scheduling"
+            )
+
         transformers_dict = {
             "optimized_attention_override": anima_regional_override,
             "anima_regional_bias_template": bias_template.detach().cpu(),
@@ -375,6 +446,11 @@ class AnimaApplyRegionalAttentionHook:
             "anima_regional_cross_only": bool(apply_to_cross_attn_only),
             "anima_regional_debug": bool(debug_shapes),
         }
+
+        if start_sigma is not None:
+            transformers_dict["anima_regional_start_sigma"] = start_sigma
+        if end_sigma is not None:
+            transformers_dict["anima_regional_end_sigma"] = end_sigma
 
         hook_group = comfy_hooks.HookGroup()
         hook_group.add(comfy_hooks.TransformerOptionsHook(transformers_dict=transformers_dict))

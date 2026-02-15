@@ -175,7 +175,13 @@
         "13",
         0
       ],
+      "model": [
+        "1",
+        0
+      ],
       "apply_to_cross_attn_only": true,
+      "start_percent": 0.20,
+      "end_percent": 1.0,
       "debug_shapes": false
     }
   },
