@@ -1,0 +1,232 @@
+{
+  "1": {
+    "class_type": "CheckpointLoaderSimple",
+    "inputs": {
+      "ckpt_name": "anima.safetensors"
+    }
+  },
+  "2": {
+    "class_type": "EmptyLatentImage",
+    "inputs": {
+      "width": 1024,
+      "height": 1024,
+      "batch_size": 1
+    }
+  },
+  "3": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": [
+        "1",
+        1
+      ],
+      "text": "studio lighting, photoreal, high detail"
+    }
+  },
+  "4": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": [
+        "1",
+        1
+      ],
+      "text": "red sports car"
+    }
+  },
+  "5": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": [
+        "1",
+        1
+      ],
+      "text": "blue owl"
+    }
+  },
+  "6": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": [
+        "1",
+        1
+      ],
+      "text": "blurry, low quality, artifact"
+    }
+  },
+  "7": {
+    "class_type": "SolidMask",
+    "inputs": {
+      "value": 0.0,
+      "width": 1024,
+      "height": 1024
+    }
+  },
+  "8": {
+    "class_type": "SolidMask",
+    "inputs": {
+      "value": 1.0,
+      "width": 512,
+      "height": 1024
+    }
+  },
+  "9": {
+    "class_type": "MaskComposite",
+    "inputs": {
+      "destination": [
+        "7",
+        0
+      ],
+      "source": [
+        "8",
+        0
+      ],
+      "x": 0,
+      "y": 0,
+      "operation": "add"
+    }
+  },
+  "10": {
+    "class_type": "MaskComposite",
+    "inputs": {
+      "destination": [
+        "7",
+        0
+      ],
+      "source": [
+        "8",
+        0
+      ],
+      "x": 512,
+      "y": 0,
+      "operation": "add"
+    }
+  },
+  "11": {
+    "class_type": "AnimaRegionalConditioningConcat",
+    "inputs": {
+      "region_1": [
+        "4",
+        0
+      ],
+      "region_2": [
+        "5",
+        0
+      ],
+      "base": [
+        "3",
+        0
+      ],
+      "base_position": "last"
+    }
+  },
+  "12": {
+    "class_type": "AnimaMaskToTokenGrid",
+    "inputs": {
+      "model": [
+        "1",
+        0
+      ],
+      "latent": [
+        "2",
+        0
+      ],
+      "mask_1": [
+        "9",
+        0
+      ],
+      "mask_2": [
+        "10",
+        0
+      ],
+      "downscale_mode": "area",
+      "normalize_overlaps": true
+    }
+  },
+  "13": {
+    "class_type": "AnimaBuildRegionalCrossAttnBias",
+    "inputs": {
+      "ranges": [
+        "11",
+        1
+      ],
+      "token_weights": [
+        "12",
+        0
+      ],
+      "mode": "soft_log",
+      "eps": 0.0001,
+      "hard_value": -80.0,
+      "base_always_allowed": true,
+      "unmasked_to_base": true
+    }
+  },
+  "14": {
+    "class_type": "AnimaApplyRegionalAttentionHook",
+    "inputs": {
+      "positive": [
+        "11",
+        0
+      ],
+      "negative": [
+        "6",
+        0
+      ],
+      "bias_template": [
+        "13",
+        0
+      ],
+      "apply_to_cross_attn_only": true,
+      "debug_shapes": false
+    }
+  },
+  "15": {
+    "class_type": "KSampler",
+    "inputs": {
+      "model": [
+        "1",
+        0
+      ],
+      "positive": [
+        "14",
+        0
+      ],
+      "negative": [
+        "14",
+        1
+      ],
+      "latent_image": [
+        "2",
+        0
+      ],
+      "seed": 1,
+      "steps": 40,
+      "cfg": 4.5,
+      "sampler_name": "euler",
+      "scheduler": "normal",
+      "denoise": 1.0
+    }
+  },
+  "16": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "15",
+        0
+      ],
+      "vae": [
+        "1",
+        2
+      ]
+    }
+  },
+  "17": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": [
+        "16",
+        0
+      ],
+      "filename_prefix": "anima_regional_left_right"
+    }
+  }
+}
