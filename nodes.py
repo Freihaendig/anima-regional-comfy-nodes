@@ -539,11 +539,6 @@ class AnimaApplyRegionalAttentionHook:
                 "positive": ("CONDITIONING",),
                 "negative": ("CONDITIONING",),
                 "bias_template": ("REGIONAL_ATTN_BIAS_TEMPLATE",),
-                "enabled": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "Master switch. When OFF, passes conditioning through unchanged "
-                               "(useful for A/B testing regional vs non-regional output).",
-                }),
                 "apply_to_cross_attn_only": ("BOOLEAN", {"default": True}),
                 "start_percent": ("FLOAT", {
                     "default": 0.20, "min": 0.0, "max": 1.0, "step": 0.01,
@@ -560,6 +555,11 @@ class AnimaApplyRegionalAttentionHook:
             },
             "optional": {
                 "model": ("MODEL",),
+                "enabled": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Master switch. When OFF, passes conditioning through unchanged "
+                               "(useful for A/B testing regional vs non-regional output).",
+                }),
             },
         }
 
