@@ -4,7 +4,10 @@ from typing import Any
 
 import torch
 
-import comfy.hooks
+try:
+    import comfy.hooks as comfy_hooks
+except Exception:  # pragma: no cover - compatibility path for older ComfyUI builds
+    comfy_hooks = None
 
 from .regional_core import (
     build_bias_template,
@@ -306,6 +309,11 @@ class AnimaApplyRegionalAttentionHook:
     CATEGORY = "conditioning/anima_regional"
 
     def apply(self, positive, negative, bias_template, apply_to_cross_attn_only=True, debug_shapes=False):
+        if comfy_hooks is None:
+            raise RuntimeError(
+                "ComfyUI build is missing comfy.hooks. Update ComfyUI to a recent version that supports "
+                "TransformerOptionsHook."
+            )
         if not torch.is_tensor(bias_template):
             raise ValueError("bias_template must be a torch tensor")
         if bias_template.ndim != 4:
@@ -319,12 +327,12 @@ class AnimaApplyRegionalAttentionHook:
             "anima_regional_debug": bool(debug_shapes),
         }
 
-        hook_group = comfy.hooks.HookGroup()
-        hook_group.add(comfy.hooks.TransformerOptionsHook(transformers_dict=transformers_dict))
+        hook_group = comfy_hooks.HookGroup()
+        hook_group.add(comfy_hooks.TransformerOptionsHook(transformers_dict=transformers_dict))
 
         cache = {}
-        positive_out = comfy.hooks.set_hooks_for_conditioning(positive, hook_group, append_hooks=True, cache=cache)
-        negative_out = comfy.hooks.set_hooks_for_conditioning(negative, hook_group, append_hooks=True, cache=cache)
+        positive_out = comfy_hooks.set_hooks_for_conditioning(positive, hook_group, append_hooks=True, cache=cache)
+        negative_out = comfy_hooks.set_hooks_for_conditioning(negative, hook_group, append_hooks=True, cache=cache)
         return positive_out, negative_out
 
 
