@@ -1,9 +1,37 @@
 import copy
 import logging
 import math
+import os
+import time
+from pathlib import Path
 from typing import Any
 
 import torch
+
+# ---- File-based debug log (visible without terminal access) ----
+_DEBUG_LOG_PATH = Path(__file__).parent / "anima_regional_debug.log"
+_debug_enabled = True  # toggled by debug_shapes on the Apply node
+_override_call_count = 0
+_override_applied_count = 0
+_override_skipped_count = 0
+
+
+def _debug_log(msg: str) -> None:
+    """Append a timestamped message to the debug log file."""
+    try:
+        with open(_DEBUG_LOG_PATH, "a") as f:
+            f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+    except Exception:
+        pass
+
+
+def _debug_log_reset() -> None:
+    """Clear the debug log file for a fresh run."""
+    try:
+        with open(_DEBUG_LOG_PATH, "w") as f:
+            f.write(f"=== Anima Regional Debug Log (started {time.strftime('%Y-%m-%d %H:%M:%S')}) ===\n")
+    except Exception:
+        pass
 
 try:
     import comfy.hooks as comfy_hooks
@@ -218,16 +246,30 @@ def _should_apply_bias(transformer_options: dict) -> bool:
 
 
 def anima_regional_override(orig_attention_fn, q, k, v, heads, **kwargs):
+    global _override_call_count, _override_applied_count, _override_skipped_count
     transformer_options = kwargs.get("transformer_options", {})
     if not transformer_options.get("anima_regional_enabled", False):
         return orig_attention_fn(q, k, v, heads, **kwargs)
 
+    _override_call_count += 1
+    debug = transformer_options.get("anima_regional_debug", False)
+
+    # Log first call to prove override IS being triggered
+    if _override_call_count == 1:
+        _debug_log(f"OVERRIDE CALLED (first call). q={tuple(q.shape)} k={tuple(k.shape)} heads={heads}")
+
     # ---- Time gating (skip bias during early/late steps) ----
     if not _should_apply_bias(transformer_options):
+        _override_skipped_count += 1
+        if debug and _override_skipped_count <= 3:
+            sigma = _get_current_sigma(transformer_options)
+            _debug_log(f"  GATED OUT at sigma={sigma}")
         return orig_attention_fn(q, k, v, heads, **kwargs)
 
     bias_template = transformer_options.get("anima_regional_bias_template")
     if bias_template is None or not torch.is_tensor(bias_template):
+        if _override_call_count <= 2:
+            _debug_log(f"  No bias_template found in transformer_options")
         return orig_attention_fn(q, k, v, heads, **kwargs)
 
     n_q = q.shape[-2]
@@ -238,12 +280,11 @@ def anima_regional_override(orig_attention_fn, q, k, v, heads, **kwargs):
         return orig_attention_fn(q, k, v, heads, **kwargs)
 
     if bias_template.shape[-2:] != (n_q, n_k):
-        if transformer_options.get("anima_regional_debug", False):
-            LOGGER.warning(
-                "anima_regional: bias shape mismatch. expected (..., %s, %s) got %s",
-                n_q,
-                n_k,
-                tuple(bias_template.shape),
+        # Log EVERY shape mismatch (this is critical diagnostic info)
+        if _override_call_count <= 5 or debug:
+            _debug_log(
+                f"  SHAPE MISMATCH: bias_template={tuple(bias_template.shape)} "
+                f"but attention needs ({n_q}, {n_k}). q={tuple(q.shape)} k={tuple(k.shape)}"
             )
         return orig_attention_fn(q, k, v, heads, **kwargs)
 
@@ -264,6 +305,14 @@ def anima_regional_override(orig_attention_fn, q, k, v, heads, **kwargs):
         if "_anima_cache" not in transformer_options:
             transformer_options["_anima_cache"] = {}
         transformer_options["_anima_cache"][cache_key] = bias
+
+    _override_applied_count += 1
+    if _override_applied_count <= 3:
+        sigma = _get_current_sigma(transformer_options)
+        _debug_log(
+            f"  BIAS APPLIED #{_override_applied_count}: n_q={n_q} n_k={n_k} "
+            f"bias_range=[{bias.min().item():.2f}, {bias.max().item():.2f}] sigma={sigma}"
+        )
 
     existing_mask = kwargs.get("mask")
     if existing_mask is None:
@@ -333,9 +382,9 @@ class AnimaRegionalConditioningConcat:
             n_before = cross_attn.shape[1]
             cross_attn, options, real_length = _strip_padding(cross_attn, options)
             if real_length < n_before:
-                print(
-                    f"[AnimaRegional] Stripped {n_before - real_length} padding tokens "
-                    f"from '{name}' ({n_before} → {real_length})"
+                _debug_log(
+                    f"  Stripped {n_before - real_length} padding tokens "
+                    f"from '{name}' ({n_before} -> {real_length})"
                 )
 
             ordered_data.append((name, cross_attn, options))
@@ -358,6 +407,15 @@ class AnimaRegionalConditioningConcat:
             "base_name": base_name,
             "total_tokens": position,
         }
+
+        # Log segment layout
+        _debug_log(f"CONCAT: {len(segment_ranges)} segments, total_tokens={position}")
+        for seg in segment_ranges:
+            _debug_log(f"  {seg['name']}: tokens [{seg['start']}..{seg['end']})")
+        _debug_log(f"  concat shape: {tuple(concat_cross_attn.shape)}")
+        opt_keys = [k for k in chosen_options.keys() if k != "pooled_output"]
+        _debug_log(f"  options keys: {opt_keys}")
+
         return conditioning_cat, ranges
 
 
@@ -428,6 +486,8 @@ class AnimaMaskToTokenGrid:
             weights = normalize_region_weights(weights)
 
         n_tokens = int(h_tok * w_tok)
+        _debug_log(f"MASK_TO_TOKEN: patch_size={patch_size}, latent=({latent_h},{latent_w}), "
+                   f"grid=({h_tok},{w_tok}), N_img_tokens={n_tokens}")
         token_weights = {
             "N_img_tokens": n_tokens,
             "H_tok": h_tok,
@@ -479,6 +539,11 @@ class AnimaApplyRegionalAttentionHook:
                 "positive": ("CONDITIONING",),
                 "negative": ("CONDITIONING",),
                 "bias_template": ("REGIONAL_ATTN_BIAS_TEMPLATE",),
+                "enabled": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Master switch. When OFF, passes conditioning through unchanged "
+                               "(useful for A/B testing regional vs non-regional output).",
+                }),
                 "apply_to_cross_attn_only": ("BOOLEAN", {"default": True}),
                 "start_percent": ("FLOAT", {
                     "default": 0.20, "min": 0.0, "max": 1.0, "step": 0.01,
@@ -504,8 +569,20 @@ class AnimaApplyRegionalAttentionHook:
     CATEGORY = "conditioning/anima_regional"
 
     def apply(self, positive, negative, bias_template,
-              apply_to_cross_attn_only=True, start_percent=0.20, end_percent=1.0,
+              enabled=True, apply_to_cross_attn_only=True, start_percent=0.20, end_percent=1.0,
               debug_shapes=False, model=None):
+        global _override_call_count, _override_applied_count, _override_skipped_count
+
+        # Reset debug state for each execution
+        _override_call_count = 0
+        _override_applied_count = 0
+        _override_skipped_count = 0
+        _debug_log_reset()
+
+        if not enabled:
+            _debug_log("DISABLED — passing conditioning through unchanged")
+            return positive, negative
+
         if comfy_hooks is None:
             raise RuntimeError(
                 "ComfyUI build is missing comfy.hooks. Update ComfyUI to a recent version that supports "
@@ -516,9 +593,14 @@ class AnimaApplyRegionalAttentionHook:
         if bias_template.ndim != 4:
             raise ValueError(f"bias_template must have shape [B,1,Nq,Nk], got {tuple(bias_template.shape)}")
 
+        _debug_log(f"bias_template shape: {tuple(bias_template.shape)}")
+        _debug_log(f"  N_img_tokens(Nq)={bias_template.shape[2]}, N_text_tokens(Nk)={bias_template.shape[3]}")
+        _debug_log(f"  bias value range: [{bias_template.min().item():.4f}, {bias_template.max().item():.4f}]")
+        _debug_log(f"  start_percent={start_percent}, end_percent={end_percent}")
+        _debug_log(f"  cross_only={apply_to_cross_attn_only}, debug={debug_shapes}")
+        _debug_log(f"  model connected: {model is not None}")
+
         # ---- Convert percent → sigma thresholds ----
-        # start_sigma: bias activates when sigma drops BELOW this value
-        # end_sigma:   bias deactivates when sigma drops BELOW this value
         start_sigma = None
         end_sigma = None
         if model is not None:
@@ -526,26 +608,11 @@ class AnimaApplyRegionalAttentionHook:
             if model_sampling is not None and hasattr(model_sampling, "percent_to_sigma"):
                 start_sigma = float(model_sampling.percent_to_sigma(start_percent))
                 end_sigma = float(model_sampling.percent_to_sigma(end_percent))
-                print(
-                    f"[AnimaRegional] Scheduling bias: {start_percent*100:.0f}%-{end_percent*100:.0f}% "
-                    f"(sigma {start_sigma:.4f} → {end_sigma:.4f})"
-                )
+                _debug_log(f"  sigma thresholds: start={start_sigma:.4f}, end={end_sigma:.4f}")
             else:
-                print(
-                    "[AnimaRegional] WARNING: model has no percent_to_sigma; "
-                    "falling back to runtime sigma estimation"
-                )
+                _debug_log("  WARNING: model has no percent_to_sigma, using runtime estimation")
         else:
-            if start_percent > 0.0 or end_percent < 1.0:
-                print(
-                    f"[AnimaRegional] No model connected — using runtime sigma estimation "
-                    f"for scheduling ({start_percent*100:.0f}%-{end_percent*100:.0f}%)"
-                )
-            else:
-                print(
-                    "[AnimaRegional] No model connected, bias active for ALL steps. "
-                    "Set start_percent > 0 to delay activation (recommended: 0.15-0.40)"
-                )
+            _debug_log("  No model — using runtime sigma estimation for gating")
 
         transformers_dict = {
             "optimized_attention_override": anima_regional_override,
@@ -553,15 +620,11 @@ class AnimaApplyRegionalAttentionHook:
             "anima_regional_enabled": True,
             "anima_regional_cross_only": bool(apply_to_cross_attn_only),
             "anima_regional_debug": bool(debug_shapes),
-            # Always store percentages for the runtime fallback gating path.
             "anima_regional_start_percent": float(start_percent),
             "anima_regional_end_percent": float(end_percent),
-            # Mutable dict for runtime sigma tracking (persists across steps
-            # because merge_nested_dicts assigns by reference).
             "_anima_state": {},
         }
 
-        # When model is available, also add accurate sigma thresholds.
         if start_sigma is not None:
             transformers_dict["anima_regional_start_sigma"] = start_sigma
         if end_sigma is not None:
@@ -573,6 +636,8 @@ class AnimaApplyRegionalAttentionHook:
         cache = {}
         positive_out = comfy_hooks.set_hooks_for_conditioning(positive, hook_group, append_hooks=True, cache=cache)
         negative_out = comfy_hooks.set_hooks_for_conditioning(negative, hook_group, append_hooks=True, cache=cache)
+
+        _debug_log("Hook registered. Waiting for sampling to begin...")
         return positive_out, negative_out
 
 
