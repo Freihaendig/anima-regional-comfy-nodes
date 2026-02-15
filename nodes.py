@@ -38,6 +38,15 @@ try:
 except Exception:  # pragma: no cover - compatibility path for older ComfyUI builds
     comfy_hooks = None
 
+# PyTorch-native attention fallback.  xformers does not support tensor
+# ``attn_bias`` on every GPU architecture (e.g. Blackwell SM 12.0 has no
+# compatible FA/cutlass backend).  When we inject a regional bias we
+# route through PyTorch SDPA instead, which works everywhere.
+try:
+    from comfy.ldm.modules.attention import attention_pytorch as _attention_pytorch
+except Exception:  # pragma: no cover
+    _attention_pytorch = None
+
 from .regional_core import (
     build_bias_template,
     build_cond_uncond_gated_bias,
@@ -355,6 +364,21 @@ def anima_regional_override(orig_attention_fn, q, k, v, heads, **kwargs):
     else:
         kwargs["mask"] = bias
 
+    # ---- Backend selection ------------------------------------------------
+    # xformers ``memory_efficient_attention`` does not support a plain-tensor
+    # ``attn_bias`` on every GPU architecture (notably Blackwell / SM 12.0
+    # has no compatible FA or cutlass backend).  When we inject a regional
+    # bias tensor we therefore route through PyTorch-native SDPA which
+    # accepts ``attn_mask`` on all CUDA devices.
+    #
+    # ``_attention_pytorch`` is the *wrapped* version (has @wrap_attn) but
+    # the caller (wrap_attn.wrapper) already placed ``_inside_attn_wrapper``
+    # into *kwargs*, so calling it here skips the override check and goes
+    # straight to the inner function — no infinite recursion.
+    if _attention_pytorch is not None:
+        return _attention_pytorch(q, k, v, heads, **kwargs)
+
+    # Fallback: hope for the best with the original backend.
     return orig_attention_fn(q, k, v, heads, **kwargs)
 
 
