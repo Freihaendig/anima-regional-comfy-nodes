@@ -118,6 +118,25 @@ class StripPaddingTests(unittest.TestCase):
         self.assertIs(stripped, cross_attn)
 
 
+class MergeSegmentOptionsTests(unittest.TestCase):
+    def test_stale_attention_mask_is_removed(self):
+        from anima_regional_custom_nodes.nodes import _merge_segment_options
+
+        ordered_data = [
+            ("region_1", torch.randn(1, 3, 8), {"t5xxl_ids": torch.tensor([1, 2, 3])}),
+            ("region_2", torch.randn(1, 2, 8), {"t5xxl_ids": torch.tensor([4, 5])}),
+        ]
+        chosen_options = {
+            "attention_mask": torch.tensor([[1.0, 1.0, 0.0, 0.0]]),
+            "t5xxl_ids": torch.tensor([10, 11, 12, 0]),
+        }
+
+        merged = _merge_segment_options(ordered_data, chosen_options)
+        self.assertNotIn("attention_mask", merged)
+        self.assertIn("t5xxl_ids", merged)
+        self.assertEqual(merged["t5xxl_ids"].numel(), 5)
+
+
 class OverrideTimeGatingTests(unittest.TestCase):
     """Test that anima_regional_override respects sigma-based time gating."""
 

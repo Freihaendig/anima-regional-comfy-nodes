@@ -134,6 +134,11 @@ def _merge_segment_options(
     merged = copy.deepcopy(chosen_options)
 
     keys_to_concat = ("t5xxl_ids", "t5xxl_weights", "attention_mask")
+    # Remove stale per-segment metadata up front. If concatenation below cannot
+    # rebuild a key, we prefer omitting it over keeping mismatched lengths.
+    for key in keys_to_concat:
+        merged.pop(key, None)
+
     for key in keys_to_concat:
         chunks = []
         all_have_key = True
