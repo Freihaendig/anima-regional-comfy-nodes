@@ -134,6 +134,15 @@ class OverrideTimeGatingTests(unittest.TestCase):
             return torch.zeros(q.shape[0], q.shape[1], q.shape[2], v.shape[-1])
         return fn
 
+    def _base_transformer_options(self, bias_template):
+        return {
+            "anima_regional_enabled": True,
+            "anima_regional_bias_template": bias_template,
+            "anima_regional_cross_only": True,
+            "anima_regional_start_sigma": 5.0,
+            "anima_regional_end_sigma": 0.0,
+        }
+
     def test_bias_skipped_when_sigma_too_high(self):
         """During early steps (high sigma), bias should be skipped."""
         from anima_regional_custom_nodes.nodes import anima_regional_override
@@ -144,15 +153,11 @@ class OverrideTimeGatingTests(unittest.TestCase):
 
         call_log = []
         # sigma=10.0 is above start_sigma=5.0 → should skip bias
-        transformer_options = {
-            "anima_regional_enabled": True,
-            "anima_regional_bias_template": bias_template,
-            "anima_regional_cross_only": True,
-            "anima_regional_start_sigma": 5.0,
-            "anima_regional_end_sigma": 0.0,
-            "sigmas": torch.tensor([10.0]),
-        }
-        anima_regional_override(self._fake_attn(call_log), q, k, v, 4, transformer_options=transformer_options)
+        transformer_options = self._base_transformer_options(bias_template)
+        transformer_options["sigmas"] = torch.tensor([10.0])
+        out = anima_regional_override(self._fake_attn(call_log), q, k, v, 4, transformer_options=transformer_options)
+        self.assertEqual(tuple(out.shape), (1, 4, n_img, q.shape[-1]))
+        self.assertEqual(len(call_log), 1, "Original attention should be called when bias is skipped")
         self.assertIsNone(call_log[-1], "Bias should be skipped when sigma > start_sigma")
 
     def test_bias_applied_when_sigma_in_range(self):
@@ -165,16 +170,11 @@ class OverrideTimeGatingTests(unittest.TestCase):
 
         call_log = []
         # sigma=3.0 is below start_sigma=5.0 and above end_sigma=0.0 → should apply
-        transformer_options = {
-            "anima_regional_enabled": True,
-            "anima_regional_bias_template": bias_template,
-            "anima_regional_cross_only": True,
-            "anima_regional_start_sigma": 5.0,
-            "anima_regional_end_sigma": 0.0,
-            "sigmas": torch.tensor([3.0]),
-        }
-        anima_regional_override(self._fake_attn(call_log), q, k, v, 4, transformer_options=transformer_options)
-        self.assertIsNotNone(call_log[-1], "Bias should be applied when sigma is in active range")
+        transformer_options = self._base_transformer_options(bias_template)
+        transformer_options["sigmas"] = torch.tensor([3.0])
+        out = anima_regional_override(self._fake_attn(call_log), q, k, v, 4, transformer_options=transformer_options)
+        self.assertEqual(tuple(out.shape), (1, 4, n_img, q.shape[-1]))
+        self.assertEqual(len(call_log), 0, "Inline biased attention should bypass original attention when active")
 
     def test_bias_skipped_when_sigma_below_end(self):
         """After end_sigma, bias should stop being applied."""
@@ -186,16 +186,29 @@ class OverrideTimeGatingTests(unittest.TestCase):
 
         call_log = []
         # sigma=0.01 is below end_sigma=0.5 → should skip
-        transformer_options = {
-            "anima_regional_enabled": True,
-            "anima_regional_bias_template": bias_template,
-            "anima_regional_cross_only": True,
-            "anima_regional_start_sigma": 5.0,
-            "anima_regional_end_sigma": 0.5,
-            "sigmas": torch.tensor([0.01]),
-        }
-        anima_regional_override(self._fake_attn(call_log), q, k, v, 4, transformer_options=transformer_options)
+        transformer_options = self._base_transformer_options(bias_template)
+        transformer_options["anima_regional_end_sigma"] = 0.5
+        transformer_options["sigmas"] = torch.tensor([0.01])
+        out = anima_regional_override(self._fake_attn(call_log), q, k, v, 4, transformer_options=transformer_options)
+        self.assertEqual(tuple(out.shape), (1, 4, n_img, q.shape[-1]))
+        self.assertEqual(len(call_log), 1, "Original attention should be called when bias is out of active range")
         self.assertIsNone(call_log[-1], "Bias should be skipped when sigma < end_sigma")
+
+    def test_bias_skipped_when_nk_smaller_than_bias(self):
+        """If attn Nk is shorter than regional text Nk, skip (unsafe to truncate)."""
+        from anima_regional_custom_nodes.nodes import anima_regional_override
+
+        n_img, bias_text = 4, 8
+        q, k, v = self._make_qkv(n_img, 4)
+        bias_template = torch.full((1, 1, n_img, bias_text), -5.0)
+
+        call_log = []
+        transformer_options = self._base_transformer_options(bias_template)
+        transformer_options["sigmas"] = torch.tensor([3.0])  # active range
+        out = anima_regional_override(self._fake_attn(call_log), q, k, v, 4, transformer_options=transformer_options)
+        self.assertEqual(tuple(out.shape), (1, 4, n_img, q.shape[-1]))
+        self.assertEqual(len(call_log), 1, "Original attention should be called for Nk<bias Nk safety path")
+        self.assertIsNone(call_log[-1])
 
 
 class RuntimeSigmaFallbackTests(unittest.TestCase):

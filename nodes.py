@@ -291,13 +291,29 @@ def anima_regional_override(orig_attention_fn, q, k, v, heads, **kwargs):
             )
         return orig_attention_fn(q, k, v, heads, **kwargs)
 
-    # ---- Nk mismatch: pad bias to match (model pads text to fixed length) ----
+    # ---- Nk mismatch handling ----
+    # Safe rules:
+    # - If model key length is smaller than our concatenated regional text length,
+    #   we cannot map region segments reliably -> skip bias for this layer.
+    # - If key length is much larger than typical text context, this is likely a
+    #   non-text cross-attention path -> skip to avoid destabilizing sampling.
+    # - Otherwise, pad (never truncate) to support models that right-pad text to
+    #   a fixed context length (for example 512).
     if bias_nk != n_k:
-        if bias_nk > n_k:
-            # Bias is WIDER than needed — truncate (shouldn't normally happen)
-            if _override_call_count <= 3:
-                _debug_log(f"  Truncating bias Nk: {bias_nk} -> {n_k}")
-            bias_template = bias_template[:, :, :, :n_k]
+        if n_k < bias_nk:
+            if _override_call_count <= 5 or debug:
+                _debug_log(
+                    f"  Nk MISMATCH (skip): attn Nk={n_k} is smaller than bias Nk={bias_nk}. "
+                    "Likely truncated or non-text context."
+                )
+            return orig_attention_fn(q, k, v, heads, **kwargs)
+        if n_k > 2048:
+            if _override_call_count <= 5 or debug:
+                _debug_log(
+                    f"  Nk MISMATCH (skip): attn Nk={n_k} exceeds text-safe threshold; "
+                    "likely non-text cross-attention."
+                )
+            return orig_attention_fn(q, k, v, heads, **kwargs)
         else:
             # Bias is NARROWER than needed — model pads text to fixed length
             # (e.g., Anima pads LLMAdapter output to 512).
@@ -618,10 +634,10 @@ class AnimaApplyRegionalAttentionHook:
                 "bias_template": ("REGIONAL_ATTN_BIAS_TEMPLATE",),
                 "apply_to_cross_attn_only": ("BOOLEAN", {"default": True}),
                 "start_percent": ("FLOAT", {
-                    "default": 0.20, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "default": 0.30, "min": 0.0, "max": 1.0, "step": 0.01,
                     "tooltip": "Fraction of denoising steps to SKIP before activating regional bias. "
                                "Early steps form global composition; applying bias too early produces "
-                               "impressionistic / noisy output. Recommended range: 0.15 - 0.40.",
+                               "impressionistic / noisy output. Recommended range: 0.20 - 0.45.",
                 }),
                 "end_percent": ("FLOAT", {
                     "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
@@ -646,7 +662,7 @@ class AnimaApplyRegionalAttentionHook:
     CATEGORY = "conditioning/anima_regional"
 
     def apply(self, positive, negative, bias_template,
-              enabled=True, apply_to_cross_attn_only=True, start_percent=0.20, end_percent=1.0,
+              enabled=True, apply_to_cross_attn_only=True, start_percent=0.30, end_percent=1.0,
               debug_shapes=False, model=None):
         global _override_call_count, _override_applied_count, _override_skipped_count
 

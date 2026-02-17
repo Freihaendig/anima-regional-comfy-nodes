@@ -73,6 +73,18 @@ Prompt-style JSON examples are provided at:
 - Bias mode: `soft_log`
 - Keep `base_always_allowed = true`
 
+## Troubleshooting noisy split output
+
+If output looks like static/noise with only a faint left-right split:
+
+- Increase `start_percent` to `0.30`-`0.45` (regional bias starts too early is the most common cause).
+- Keep a meaningful `base` prompt and leave `base_always_allowed = true`.
+- Enable `debug_shapes = true` in `AnimaApplyRegionalAttentionHook` and inspect
+  `anima_regional_debug.log` in this node folder:
+  - If you see repeated `Nq MISMATCH` or `Nk MISMATCH`, the hook is skipping or hitting
+    incompatible attention layers.
+  - If no `BIAS APPLIED` lines appear during sampling, regional conditioning is not active.
+
 ## Notes and limitations
 
 - This MVP expects each input conditioning to have exactly one conditioning entry.

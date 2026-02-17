@@ -1,8 +1,9 @@
 {
   "1": {
-    "class_type": "CheckpointLoaderSimple",
+    "class_type": "UNETLoader",
     "inputs": {
-      "ckpt_name": "anima.safetensors"
+      "unet_name": "anima_diffusion.safetensors",
+      "weight_dtype": "default"
     }
   },
   "2": {
@@ -17,8 +18,8 @@
     "class_type": "CLIPTextEncode",
     "inputs": {
       "clip": [
-        "1",
-        1
+        "18",
+        0
       ],
       "text": "studio lighting, photoreal, high detail"
     }
@@ -27,8 +28,8 @@
     "class_type": "CLIPTextEncode",
     "inputs": {
       "clip": [
-        "1",
-        1
+        "18",
+        0
       ],
       "text": "red sports car"
     }
@@ -37,8 +38,8 @@
     "class_type": "CLIPTextEncode",
     "inputs": {
       "clip": [
-        "1",
-        1
+        "18",
+        0
       ],
       "text": "blue owl"
     }
@@ -47,8 +48,8 @@
     "class_type": "CLIPTextEncode",
     "inputs": {
       "clip": [
-        "1",
-        1
+        "18",
+        0
       ],
       "text": "blurry, low quality, artifact"
     }
@@ -180,7 +181,7 @@
         0
       ],
       "apply_to_cross_attn_only": true,
-      "start_percent": 0.20,
+      "start_percent": 0.35,
       "end_percent": 1.0,
       "debug_shapes": false
     }
@@ -220,8 +221,8 @@
         0
       ],
       "vae": [
-        "1",
-        2
+        "19",
+        0
       ]
     }
   },
@@ -233,6 +234,19 @@
         0
       ],
       "filename_prefix": "anima_regional_left_right"
+    }
+  },
+  "18": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "anima_clip.safetensors",
+      "type": "stable_diffusion"
+    }
+  },
+  "19": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "anima_vae.safetensors"
     }
   }
 }
