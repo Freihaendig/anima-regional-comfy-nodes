@@ -76,6 +76,7 @@ Prompt-style JSON examples are provided at:
 - Sampler: start with `er_sde` (or `euler_a`) for parity with official Anima workflows
 - Bias mode: `soft_log`
 - Bias strength: start around `0.20`-`0.40`
+- Attention backend: `orig` (use `basic` only if your backend crashes with additive bias)
 - Keep `base_always_allowed = true`
 
 ## Troubleshooting noisy split output

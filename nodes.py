@@ -80,6 +80,29 @@ def _validate_single_conditioning(name: str, conditioning: Any) -> tuple[torch.T
     return cross_attn, options
 
 
+def _merge_mask_with_bias(
+    existing_mask: Any,
+    bias: torch.Tensor,
+    target_dtype: torch.dtype,
+) -> torch.Tensor:
+    if existing_mask is None:
+        return bias
+
+    if not torch.is_tensor(existing_mask):
+        return bias
+
+    if existing_mask.dtype == torch.bool:
+        max_neg_value = -torch.finfo(torch.float32).max
+        additive = torch.where(
+            existing_mask,
+            torch.zeros_like(existing_mask, dtype=torch.float32),
+            torch.full_like(existing_mask, max_neg_value, dtype=torch.float32),
+        ).to(device=bias.device, dtype=target_dtype)
+        return additive + bias
+
+    return existing_mask.to(device=bias.device, dtype=target_dtype) + bias
+
+
 def _flatten_token_tensor(value: Any) -> torch.Tensor | None:
     if not torch.is_tensor(value):
         return None
@@ -393,23 +416,25 @@ def anima_regional_override(orig_attention_fn, q, k, v, heads, **kwargs):
 
     # Merge existing attention mask with regional bias.
     existing_mask = kwargs.get("mask")
-    if existing_mask is None:
-        kwargs["mask"] = bias
-    elif torch.is_tensor(existing_mask):
-        if existing_mask.dtype == torch.bool:
-            if debug and _override_applied_count <= 3:
-                _debug_log("  existing bool mask; keeping it unchanged for compatibility")
-            kwargs["mask"] = existing_mask
-        else:
-            kwargs["mask"] = existing_mask.to(device=q.device, dtype=q.dtype) + bias
-    else:
-        kwargs["mask"] = bias
+    kwargs["mask"] = _merge_mask_with_bias(existing_mask=existing_mask, bias=bias, target_dtype=q.dtype)
 
-    # Use Comfy's stable einsum attention path for additive bias.
-    if _attention_basic is not None:
-        out = _attention_basic(q, k, v, heads, **kwargs)
+    attention_backend = transformer_options.get("anima_regional_attention_backend", "orig")
+    if attention_backend == "basic":
+        if _attention_basic is not None:
+            out = _attention_basic(q, k, v, heads, **kwargs)
+        else:
+            out = orig_attention_fn(q, k, v, heads, **kwargs)
     else:
-        out = orig_attention_fn(q, k, v, heads, **kwargs)
+        # Prefer the model's native backend for quality parity. Fallback to
+        # attention_basic only if native backend fails with additive bias.
+        try:
+            out = orig_attention_fn(q, k, v, heads, **kwargs)
+        except Exception as ex:
+            if _attention_basic is None:
+                raise
+            if debug or _override_applied_count <= 3:
+                _debug_log(f"  Native attention failed ({type(ex).__name__}); falling back to attention_basic")
+            out = _attention_basic(q, k, v, heads, **kwargs)
 
     if _override_applied_count <= 3 and torch.is_tensor(out):
         has_nan = torch.isnan(out).any().item()
@@ -643,6 +668,12 @@ class AnimaApplyRegionalAttentionHook:
                 "negative": ("CONDITIONING",),
                 "bias_template": ("REGIONAL_ATTN_BIAS_TEMPLATE",),
                 "apply_to_cross_attn_only": ("BOOLEAN", {"default": True}),
+                "attention_backend": (["orig", "basic"], {
+                    "default": "orig",
+                    "tooltip": "Attention compute backend when regional bias is active. "
+                               "'orig' preserves model-native behavior and is preferred for quality. "
+                               "'basic' uses Comfy attention_basic as a compatibility fallback.",
+                }),
                 "start_percent": ("FLOAT", {
                     "default": 0.30, "min": 0.0, "max": 1.0, "step": 0.01,
                     "tooltip": "Fraction of denoising steps to SKIP before activating regional bias. "
@@ -672,7 +703,8 @@ class AnimaApplyRegionalAttentionHook:
     CATEGORY = "conditioning/anima_regional"
 
     def apply(self, positive, negative, bias_template,
-              enabled=True, apply_to_cross_attn_only=True, start_percent=0.30, end_percent=1.0,
+              enabled=True, apply_to_cross_attn_only=True, attention_backend="orig",
+              start_percent=0.30, end_percent=1.0,
               debug_shapes=False, model=None):
         global _override_call_count, _override_applied_count, _override_skipped_count
 
@@ -701,6 +733,7 @@ class AnimaApplyRegionalAttentionHook:
         _debug_log(f"  bias value range: [{bias_template.min().item():.4f}, {bias_template.max().item():.4f}]")
         _debug_log(f"  start_percent={start_percent}, end_percent={end_percent}")
         _debug_log(f"  cross_only={apply_to_cross_attn_only}, debug={debug_shapes}")
+        _debug_log(f"  attention_backend={attention_backend}")
         _debug_log(f"  model connected: {model is not None}")
 
         # ---- Convert percent → sigma thresholds ----
@@ -761,6 +794,7 @@ class AnimaApplyRegionalAttentionHook:
             "anima_regional_bias_template": bias_template.detach().cpu(),
             "anima_regional_enabled": True,
             "anima_regional_cross_only": bool(apply_to_cross_attn_only),
+            "anima_regional_attention_backend": str(attention_backend),
             "anima_regional_debug": bool(debug_shapes),
             "anima_regional_start_percent": float(start_percent),
             "anima_regional_end_percent": float(end_percent),

@@ -182,6 +182,7 @@
         0
       ],
       "apply_to_cross_attn_only": true,
+      "attention_backend": "orig",
       "start_percent": 0.5,
       "end_percent": 1.0,
       "debug_shapes": false
