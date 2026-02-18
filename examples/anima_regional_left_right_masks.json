@@ -155,8 +155,9 @@
         0
       ],
       "mode": "soft_log",
-      "eps": 0.0001,
+      "eps": 0.001,
       "hard_value": -80.0,
+      "strength": 0.35,
       "base_always_allowed": true,
       "unmasked_to_base": true
     }
@@ -181,7 +182,7 @@
         0
       ],
       "apply_to_cross_attn_only": true,
-      "start_percent": 0.35,
+      "start_percent": 0.5,
       "end_percent": 1.0,
       "debug_shapes": false
     }

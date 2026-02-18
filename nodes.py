@@ -359,7 +359,16 @@ def anima_regional_override(orig_attention_fn, q, k, v, heads, **kwargs):
 
     # ---- Device-side caching ----
     # Avoid repeated CPU->GPU transfers of the bias template on every attention call.
-    cache_key = ("anima_regional_bias_cache", q.shape[0], id(cond_or_uncond), q.device, q.dtype)
+    cond_key = tuple(int(x) for x in cond_or_uncond) if cond_or_uncond else None
+    cache_key = (
+        "anima_regional_bias_cache",
+        q.shape[0],
+        n_q,
+        n_k,
+        cond_key,
+        q.device,
+        q.dtype,
+    )
     cached = transformer_options.get("_anima_cache", {}).get(cache_key)
     if cached is not None:
         bias = cached
@@ -594,6 +603,11 @@ class AnimaBuildRegionalCrossAttnBias:
                 "mode": (["soft_log", "hard"], {"default": "soft_log"}),
                 "eps": ("FLOAT", {"default": 1e-4, "min": 1e-8, "max": 1.0, "step": 1e-4}),
                 "hard_value": ("FLOAT", {"default": -80.0, "min": -200.0, "max": -1.0, "step": 1.0}),
+                "strength": ("FLOAT", {
+                    "default": 0.35, "min": 0.0, "max": 2.0, "step": 0.01,
+                    "tooltip": "Scales regional bias magnitude. Lower values are safer for unstable models "
+                               "or short prompts. 0 disables regional effect, 1 matches raw bias.",
+                }),
                 "base_always_allowed": ("BOOLEAN", {"default": True}),
                 "unmasked_to_base": ("BOOLEAN", {"default": True}),
             }
@@ -604,7 +618,7 @@ class AnimaBuildRegionalCrossAttnBias:
     FUNCTION = "build"
     CATEGORY = "conditioning/anima_regional"
 
-    def build(self, ranges, token_weights, mode, eps, hard_value, base_always_allowed, unmasked_to_base):
+    def build(self, ranges, token_weights, mode, eps, hard_value, strength, base_always_allowed, unmasked_to_base):
         bias_template = build_bias_template(
             ranges=ranges,
             token_weights=token_weights,
@@ -614,6 +628,9 @@ class AnimaBuildRegionalCrossAttnBias:
             base_always_allowed=base_always_allowed,
             unmasked_to_base=unmasked_to_base,
         )
+        strength = float(strength)
+        if strength != 1.0:
+            bias_template = bias_template * strength
         return (bias_template,)
 
 
@@ -696,14 +713,39 @@ class AnimaApplyRegionalAttentionHook:
             sampling_name = model_sampling.__class__.__name__ if model_sampling is not None else "None"
             diffusion_name = diffusion_model.__class__.__name__ if diffusion_model is not None else "None"
             _debug_log(f"  model types: diffusion={diffusion_name}, sampling={sampling_name}")
+            shift_value = None
+            multiplier_value = None
+            if model_sampling is not None:
+                shift_value = getattr(model_sampling, "shift", None)
+                multiplier_value = getattr(model_sampling, "multiplier", None)
+            _debug_log(f"  sampling attrs: shift={shift_value}, multiplier={multiplier_value}")
             if diffusion_model is not None:
                 dname = diffusion_name.lower()
                 sname = sampling_name.lower()
-                if ("cosmos" in dname or "aura" in dname or "anima" in dname) and ("auraflow" not in sname):
-                    _debug_log(
-                        "  WARNING: model looks Anima/Cosmos-like but sampling patch is not AuraFlow. "
-                        "This often produces noisy or unfinished outputs."
-                    )
+                anima_like = ("cosmos" in dname or "aura" in dname or "anima" in dname)
+                if anima_like:
+                    shift_float = None
+                    try:
+                        if torch.is_tensor(shift_value):
+                            shift_float = float(shift_value.item())
+                        elif shift_value is not None:
+                            shift_float = float(shift_value)
+                    except Exception:
+                        shift_float = None
+
+                    # Some Comfy samplers expose generic dynamic class names such as
+                    # "ModelSamplingAdvanced". In that case, shift is a better signal
+                    # than class name alone.
+                    if shift_float is None and ("auraflow" not in sname) and ("advanced" not in sname):
+                        _debug_log(
+                            "  WARNING: model looks Anima/Cosmos-like but sampling patch may not be AuraFlow. "
+                            "This often produces noisy or unfinished outputs."
+                        )
+                    elif shift_float is not None and abs(shift_float - 3.0) > 0.75:
+                        _debug_log(
+                            f"  WARNING: Anima/Cosmos model shift={shift_float:.3f} (expected near 3.0). "
+                            "Sampling mismatch can cause noisy output."
+                        )
 
             if model_sampling is not None and hasattr(model_sampling, "percent_to_sigma"):
                 start_sigma = float(model_sampling.percent_to_sigma(start_percent))

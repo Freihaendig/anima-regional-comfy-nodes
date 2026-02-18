@@ -75,6 +75,7 @@ Prompt-style JSON examples are provided at:
 - CFG: around `4.5`
 - Sampler: start with `er_sde` (or `euler_a`) for parity with official Anima workflows
 - Bias mode: `soft_log`
+- Bias strength: start around `0.20`-`0.40`
 - Keep `base_always_allowed = true`
 
 ## Troubleshooting noisy split output
@@ -82,7 +83,8 @@ Prompt-style JSON examples are provided at:
 If output looks like static/noise with only a faint left-right split:
 
 - Verify your model path is patched: `UNETLoader -> ModelSamplingAuraFlow(shift=3.0) -> KSampler` and use that same patched model for `AnimaMaskToTokenGrid` + `AnimaApplyRegionalAttentionHook`.
-- Increase `start_percent` to `0.30`-`0.45` (regional bias starts too early is the most common cause).
+- Lower `strength` in `AnimaBuildRegionalCrossAttnBias` (for example `0.20`-`0.40`) if output collapses to static/noise.
+- Increase `start_percent` to `0.45`-`0.65` (regional bias starts too early is the most common cause).
 - Keep a meaningful `base` prompt and leave `base_always_allowed = true`.
 - Enable `debug_shapes = true` in `AnimaApplyRegionalAttentionHook` and inspect
   `anima_regional_debug.log` in this node folder:
