@@ -124,7 +124,7 @@
     "class_type": "AnimaMaskToTokenGrid",
     "inputs": {
       "model": [
-        "1",
+        "20",
         0
       ],
       "latent": [
@@ -177,7 +177,7 @@
         0
       ],
       "model": [
-        "1",
+        "20",
         0
       ],
       "apply_to_cross_attn_only": true,
@@ -190,7 +190,7 @@
     "class_type": "KSampler",
     "inputs": {
       "model": [
-        "1",
+        "20",
         0
       ],
       "positive": [
@@ -208,7 +208,7 @@
       "seed": 1,
       "steps": 40,
       "cfg": 4.5,
-      "sampler_name": "euler",
+      "sampler_name": "er_sde",
       "scheduler": "normal",
       "denoise": 1.0
     }
@@ -247,6 +247,16 @@
     "class_type": "VAELoader",
     "inputs": {
       "vae_name": "anima_vae.safetensors"
+    }
+  },
+  "20": {
+    "class_type": "ModelSamplingAuraFlow",
+    "inputs": {
+      "model": [
+        "1",
+        0
+      ],
+      "shift": 3.0
     }
   }
 }

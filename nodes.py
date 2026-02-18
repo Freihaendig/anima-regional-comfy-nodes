@@ -38,6 +38,13 @@ try:
 except Exception:  # pragma: no cover - compatibility path for older ComfyUI builds
     comfy_hooks = None
 
+# Pure-math attention fallback. xformers/SDPA kernels can vary across
+# architectures; attention_basic is stable and supports additive masks.
+try:
+    from comfy.ldm.modules.attention import attention_basic as _attention_basic
+except Exception:  # pragma: no cover
+    _attention_basic = None
+
 from .regional_core import (
     build_bias_template,
     build_cond_uncond_gated_bias,
@@ -300,10 +307,9 @@ def anima_regional_override(orig_attention_fn, q, k, v, heads, **kwargs):
     # Safe rules:
     # - If model key length is smaller than our concatenated regional text length,
     #   we cannot map region segments reliably -> skip bias for this layer.
-    # - If key length is much larger than typical text context, this is likely a
-    #   non-text cross-attention path -> skip to avoid destabilizing sampling.
-    # - Otherwise, pad (never truncate) to support models that right-pad text to
-    #   a fixed context length (for example 512).
+    # - If key length is much larger, only pad when the extra keys look like
+    #   true padding. If they look like active context, skip (mapping unknown).
+    # - Otherwise, pad (never truncate) to support standard right-padding.
     if bias_nk != n_k:
         if n_k < bias_nk:
             if _override_call_count <= 5 or debug:
@@ -312,32 +318,42 @@ def anima_regional_override(orig_attention_fn, q, k, v, heads, **kwargs):
                     "Likely truncated or non-text context."
                 )
             return orig_attention_fn(q, k, v, heads, **kwargs)
-        if n_k > 2048:
+
+        pad_width = n_k - bias_nk
+        tail_ratio = None
+        if bias_nk > 0 and pad_width > 0:
+            head = k[..., :bias_nk, :]
+            tail = k[..., bias_nk:, :]
+            if tail.numel() > 0:
+                head_norm = float(head.float().abs().mean().item())
+                tail_norm = float(tail.float().abs().mean().item())
+                tail_ratio = tail_norm / max(head_norm, 1e-8)
+
+        large_expansion = (pad_width > 128) or (n_k >= max(256, bias_nk * 4))
+        if large_expansion and (tail_ratio is None or tail_ratio > 0.20):
             if _override_call_count <= 5 or debug:
                 _debug_log(
-                    f"  Nk MISMATCH (skip): attn Nk={n_k} exceeds text-safe threshold; "
-                    "likely non-text cross-attention."
+                    f"  Nk MISMATCH (skip): {bias_nk}->{n_k} looks like remapped context "
+                    f"(tail_ratio={tail_ratio})."
                 )
             return orig_attention_fn(q, k, v, heads, **kwargs)
-        else:
-            # Bias is NARROWER than needed — model pads text to fixed length
-            # (e.g., Anima pads LLMAdapter output to 512).
-            # Pad with minimum bias value to SUPPRESS attention to padding tokens.
-            pad_width = n_k - bias_nk
-            pad_value = float(bias_template.min().item())
-            if _override_call_count <= 3:
-                _debug_log(
-                    f"  Padding bias Nk: {bias_nk} -> {n_k} (+{pad_width} cols, "
-                    f"fill={pad_value:.2f})"
-                )
-            padding = torch.full(
-                (bias_template.shape[0], bias_template.shape[1], bias_nq, pad_width),
-                pad_value, dtype=bias_template.dtype, device=bias_template.device,
+
+        # Bias is NARROWER than needed — likely right-padded text context.
+        # Pad with minimum bias value to suppress out-of-range text keys.
+        pad_value = float(bias_template.min().item())
+        if _override_call_count <= 3 or debug:
+            _debug_log(
+                f"  Padding bias Nk: {bias_nk} -> {n_k} (+{pad_width} cols, "
+                f"fill={pad_value:.2f}, tail_ratio={tail_ratio})"
             )
-            bias_template = torch.cat([bias_template, padding], dim=-1)
-            # Update the template in transformer_options so subsequent layers
-            # within the same step reuse the padded version.
-            transformer_options["anima_regional_bias_template"] = bias_template
+        padding = torch.full(
+            (bias_template.shape[0], bias_template.shape[1], bias_nq, pad_width),
+            pad_value, dtype=bias_template.dtype, device=bias_template.device,
+        )
+        bias_template = torch.cat([bias_template, padding], dim=-1)
+        # Update the template in transformer_options so subsequent layers
+        # within the same step reuse the padded version.
+        transformer_options["anima_regional_bias_template"] = bias_template
 
     cond_or_uncond = transformer_options.get("cond_or_uncond")
 
@@ -362,52 +378,31 @@ def anima_regional_override(orig_attention_fn, q, k, v, heads, **kwargs):
         sigma = _get_current_sigma(transformer_options)
         _debug_log(
             f"  BIAS APPLIED #{_override_applied_count}: n_q={n_q} n_k={n_k} "
-            f"bias_range=[{bias.min().item():.2f}, {bias.max().item():.2f}] sigma={sigma}"
+            f"bias_range=[{bias.min().item():.2f}, {bias.max().item():.2f}] "
+            f"sigma={sigma} cond_or_uncond={cond_or_uncond}"
         )
 
-    # ---- Inline attention with regional bias ------------------------------
-    # We compute the biased attention *directly* here instead of delegating
-    # to any ComfyUI/xformers/PyTorch backend.  This avoids every possible
-    # backend incompatibility (xformers can't handle attn_bias on Blackwell;
-    # PyTorch SDPA may pick a cuDNN kernel that also fails).
-    #
-    # Cosmos feeds (B, H, S, D) with ``skip_reshape=True``.
-    # Non-Cosmos models may feed (B, S, H*D) with ``skip_reshape=False``.
-    skip_reshape = kwargs.get("skip_reshape", False)
-    if skip_reshape:
-        b, h, sq, d = q.shape
-    else:
-        b, sq_dim, hd = q.shape
-        d = hd // heads
-        h = heads
-        sq = sq_dim
-        q = q.view(b, sq, h, d).permute(0, 2, 1, 3)  # → (B,H,Sq,D)
-        k = k.view(b, -1, h, d).permute(0, 2, 1, 3)   # → (B,H,Sk,D)
-        v = v.view(b, -1, h, d).permute(0, 2, 1, 3)   # → (B,H,Sk,D)
-
-    scale = d ** -0.5
-
-    # Similarity in float32 for numerical stability
-    sim = torch.matmul(q.float(), k.float().transpose(-1, -2)) * scale
-    # sim: (B, H, Sq, Sk)
-
-    # Merge existing mask (if any) with our regional bias
+    # Merge existing attention mask with regional bias.
     existing_mask = kwargs.get("mask")
-    if existing_mask is not None and torch.is_tensor(existing_mask):
+    if existing_mask is None:
+        kwargs["mask"] = bias
+    elif torch.is_tensor(existing_mask):
         if existing_mask.dtype == torch.bool:
-            sim.masked_fill_(~existing_mask, -torch.finfo(sim.dtype).max)
+            if debug and _override_applied_count <= 3:
+                _debug_log("  existing bool mask; keeping it unchanged for compatibility")
+            kwargs["mask"] = existing_mask
         else:
-            sim = sim + existing_mask.float()
+            kwargs["mask"] = existing_mask.to(device=q.device, dtype=q.dtype) + bias
+    else:
+        kwargs["mask"] = bias
 
-    # Apply regional bias — shape (B, 1, Sq, Sk) broadcasts over heads
-    sim = sim + bias.float()
+    # Use Comfy's stable einsum attention path for additive bias.
+    if _attention_basic is not None:
+        out = _attention_basic(q, k, v, heads, **kwargs)
+    else:
+        out = orig_attention_fn(q, k, v, heads, **kwargs)
 
-    # Softmax + weighted sum
-    attn_weights = sim.softmax(dim=-1)
-    out = torch.matmul(attn_weights.to(v.dtype), v)
-    # out: (B, H, Sq, D)
-
-    if _override_applied_count <= 3:
+    if _override_applied_count <= 3 and torch.is_tensor(out):
         has_nan = torch.isnan(out).any().item()
         has_inf = torch.isinf(out).any().item()
         _debug_log(
@@ -416,14 +411,7 @@ def anima_regional_override(orig_attention_fn, q, k, v, heads, **kwargs):
             f"nan={has_nan} inf={has_inf}"
         )
 
-    # Return in the format the caller expects
-    skip_output_reshape = kwargs.get("skip_output_reshape", False)
-    if skip_output_reshape:
-        # Caller wants (B, H, Sq, D) — keep as-is
-        return out
-    else:
-        # Caller wants (B, Sq, H*D)
-        return out.permute(0, 2, 1, 3).reshape(b, -1, h * d)
+    return out
 
 
 class AnimaRegionalConditioningConcat:
@@ -703,6 +691,20 @@ class AnimaApplyRegionalAttentionHook:
         end_sigma = None
         if model is not None:
             model_sampling = model.get_model_object("model_sampling")
+            diffusion_model = model.get_model_object("diffusion_model")
+
+            sampling_name = model_sampling.__class__.__name__ if model_sampling is not None else "None"
+            diffusion_name = diffusion_model.__class__.__name__ if diffusion_model is not None else "None"
+            _debug_log(f"  model types: diffusion={diffusion_name}, sampling={sampling_name}")
+            if diffusion_model is not None:
+                dname = diffusion_name.lower()
+                sname = sampling_name.lower()
+                if ("cosmos" in dname or "aura" in dname or "anima" in dname) and ("auraflow" not in sname):
+                    _debug_log(
+                        "  WARNING: model looks Anima/Cosmos-like but sampling patch is not AuraFlow. "
+                        "This often produces noisy or unfinished outputs."
+                    )
+
             if model_sampling is not None and hasattr(model_sampling, "percent_to_sigma"):
                 start_sigma = float(model_sampling.percent_to_sigma(start_percent))
                 end_sigma = float(model_sampling.percent_to_sigma(end_percent))

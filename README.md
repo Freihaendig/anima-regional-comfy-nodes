@@ -29,6 +29,7 @@ Then restart ComfyUI.
 - Keeps cond/uncond batched in one forward pass.
 - Gates the regional bias to conditional chunks using `transformer_options["cond_or_uncond"]`.
 - Uses model patch size (`patch_spatial`) to correctly map masks to image token grid.
+- Logs model/sampling types and warns if an Anima/Cosmos-like model is not using AuraFlow sampling patching.
 
 ## Nodes
 
@@ -50,12 +51,14 @@ Then restart ComfyUI.
 
 ## Minimal workflow wiring
 
-1. Create text conditionings for `region_1`, `region_2`, and optionally `base` using your normal text encoder node.
-2. Pass them to `AnimaRegionalConditioningConcat`.
-3. Pass `MODEL`, target `LATENT`, and masks into `AnimaMaskToTokenGrid`.
-4. Build bias via `AnimaBuildRegionalCrossAttnBias`.
-5. Apply hook via `AnimaApplyRegionalAttentionHook` to produce `positive_out` and `negative_out`.
-6. Feed `positive_out` and `negative_out` into `KSampler` as usual.
+1. Load UNet via `UNETLoader`.
+2. Patch the model with `ModelSamplingAuraFlow` (`shift=3.0` for Anima examples).
+3. Create text conditionings for `region_1`, `region_2`, and optionally `base` using your normal text encoder node.
+4. Pass them to `AnimaRegionalConditioningConcat`.
+5. Pass the **patched MODEL**, target `LATENT`, and masks into `AnimaMaskToTokenGrid`.
+6. Build bias via `AnimaBuildRegionalCrossAttnBias`.
+7. Apply hook via `AnimaApplyRegionalAttentionHook` (with the **patched MODEL**) to produce `positive_out` and `negative_out`.
+8. Feed `positive_out` and `negative_out` into `KSampler` with the **same patched MODEL**.
 
 ## Example
 
@@ -70,6 +73,7 @@ Prompt-style JSON examples are provided at:
 - Resolution: around 1MP (for example `1024x1024`)
 - Steps: around `40`
 - CFG: around `4.5`
+- Sampler: start with `er_sde` (or `euler_a`) for parity with official Anima workflows
 - Bias mode: `soft_log`
 - Keep `base_always_allowed = true`
 
@@ -77,10 +81,12 @@ Prompt-style JSON examples are provided at:
 
 If output looks like static/noise with only a faint left-right split:
 
+- Verify your model path is patched: `UNETLoader -> ModelSamplingAuraFlow(shift=3.0) -> KSampler` and use that same patched model for `AnimaMaskToTokenGrid` + `AnimaApplyRegionalAttentionHook`.
 - Increase `start_percent` to `0.30`-`0.45` (regional bias starts too early is the most common cause).
 - Keep a meaningful `base` prompt and leave `base_always_allowed = true`.
 - Enable `debug_shapes = true` in `AnimaApplyRegionalAttentionHook` and inspect
   `anima_regional_debug.log` in this node folder:
+  - Confirm `model types:` appears and no sampling mismatch warning is logged.
   - If you see repeated `Nq MISMATCH` or `Nk MISMATCH`, the hook is skipping or hitting
     incompatible attention layers.
   - If no `BIAS APPLIED` lines appear during sampling, regional conditioning is not active.
